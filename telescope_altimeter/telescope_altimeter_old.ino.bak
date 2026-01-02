@@ -1,0 +1,905 @@
+/*
+ * Digital Altimeter for Skywatcher Classic 200 Telescope v2.1
+ *
+ * Hardware:
+ * - NodeMCU ESP8266
+ * - MPU6050 (I2C address 0x68)
+ * - 128x64 OLED SSD1306 (I2C address 0x3C)
+ *   Display zones: Top 10 rows YELLOW, rows 11-64 BLUE
+ * - Push button on D3 (GPIO0) with internal pullup
+ *
+ * Features:
+ * - Real-time altitude display
+ * - Rotation-invariant angle calculation (sensor can be mounted at any angle around tube)
+ * - Two-point calibration using mechanical stops
+ * - Zero-point calibration with bubble level (one-time only)
+ * - Two-stop session sync (no bubble level needed in field)
+ * - EEPROM storage for calibration data
+ * - Expandable for future azimuth integration
+ */
+
+#include <Wire.h>
+#include <MPU6050.h>
+#include <U8g2lib.h>
+#include <EEPROM.h>
+
+// ==================== CONFIGURATION ====================
+
+// Hardware pins
+#define BUTTON_PIN D3      // GPIO0 - built-in button on NodeMCU
+#define I2C_SDA D2         // GPIO4
+#define I2C_SCL D1         // GPIO5
+
+// Display zones (color-aware positioning)
+#define YELLOW_ZONE_END 10   // Rows 0-10 are yellow (11 pixels high)
+#define BLUE_ZONE_START 13   // Rows 13-64 are blue (row 11-12 is gap)
+
+// Filter settings
+#define ALPHA 0.2  // Exponential moving average factor (0-1, lower = smoother)
+
+// Button settings
+#define DEBOUNCE_DELAY 50
+#define LONG_PRESS_TIME 2000
+
+// EEPROM addresses
+#define EEPROM_SIZE 512
+#define ADDR_ZERO_OFFSET 0
+#define ADDR_STOP_A_RAW 4
+#define ADDR_STOP_B_RAW 8
+#define ADDR_CALIBRATED_FLAG 12
+#define ADDR_TUBE_AXIS_X 16
+#define ADDR_TUBE_AXIS_Y 20
+#define ADDR_TUBE_AXIS_Z 24
+
+// ==================== GLOBAL OBJECTS ====================
+
+MPU6050 mpu;
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C display(U8G2_R0, /* reset=*/ U8X8_PIN_NONE);
+
+// ==================== STATE VARIABLES ====================
+
+// Calibration data
+float zeroOffset = 0.0;
+float stopA_raw = 0.0;
+float stopB_raw = 0.0;
+bool isCalibrated = false;
+
+// Reference tube axis (normalized vector in sensor coordinates when telescope is level)
+float tubeAxis_x = 0.0;
+float tubeAxis_y = 1.0;  // Default: assume Y-axis
+float tubeAxis_z = 0.0;
+
+// Current readings
+float currentAltitude = 0.0;
+float filteredAltitude = 0.0;
+float rawAngle = 0.0;
+
+// Button state
+bool lastButtonState = HIGH;
+unsigned long buttonPressTime = 0;
+bool longPressDetected = false;
+
+// UI state
+enum UIMode {
+  MODE_NORMAL,
+  MODE_CALIBRATION_MENU,
+  MODE_ZERO_CALIBRATION,
+  MODE_STOP_A_CALIBRATION,
+  MODE_STOP_B_CALIBRATION,
+  MODE_SESSION_SYNC_A,
+  MODE_SESSION_SYNC_B
+};
+
+UIMode currentMode = MODE_NORMAL;
+
+// ==================== SETUP ====================
+
+void setup() {
+  Serial.begin(115200);
+  while (!Serial) delay(10);
+  
+  Serial.println("\n=== Telescope Altimeter v2.1 ===");
+  
+  // Initialize I2C
+  Wire.begin(I2C_SDA, I2C_SCL);
+  Wire.setClock(400000); // 400kHz fast mode
+  
+  // Initialize button
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  
+  // Initialize EEPROM
+  EEPROM.begin(EEPROM_SIZE);
+  
+  // Initialize MPU6050
+  if (!initMPU6050()) {
+    Serial.println("ERROR: MPU6050 initialization failed!");
+    showError("MPU6050 FAIL");
+    while (1) delay(100);
+  }
+  
+  // Initialize display
+  if (!initDisplay()) {
+    Serial.println("ERROR: Display initialization failed!");
+    while (1) delay(100);
+  }
+  
+  // Load calibration from EEPROM
+  loadCalibration();
+  
+  // Show startup screen
+  showStartupScreen();
+  delay(2000);
+  
+  Serial.println("Setup complete!");
+  Serial.println("Ready to measure altitude.");
+  if (isCalibrated) {
+    Serial.println("Calibration loaded from EEPROM.");
+  } else {
+    Serial.println("WARNING: Not calibrated! Long press button to calibrate.");
+  }
+}
+
+// ==================== MAIN LOOP ====================
+
+void loop() {
+  // Read sensor
+  readSensor();
+  
+  // Handle button input
+  handleButton();
+  
+  // Update display based on current mode
+  updateDisplay();
+  
+  // Small delay for stability
+  delay(100); // 10 Hz refresh rate
+}
+
+// ==================== MPU6050 FUNCTIONS ====================
+
+bool initMPU6050() {
+  mpu.initialize();
+  
+  if (!mpu.testConnection()) {
+    return false;
+  }
+  
+  // Configure MPU6050
+  mpu.setFullScaleAccelRange(MPU6050_ACCEL_FS_2);
+  mpu.setFullScaleGyroRange(MPU6050_GYRO_FS_250);
+  mpu.setDLPFMode(MPU6050_DLPF_BW_20);
+  
+  Serial.println("MPU6050 initialized successfully");
+  return true;
+}
+
+void readSensor() {
+  int16_t ax, ay, az;
+  int16_t gx, gy, gz;
+
+  mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+
+  // Convert to g (MPU6050 returns raw values)
+  // For ±2g range: sensitivity = 16384 LSB/g
+  float ax_g = ax / 16384.0;
+  float ay_g = ay / 16384.0;
+  float az_g = az / 16384.0;
+
+  // Calculate altitude angle using dot product with reference "level" gravity vector
+  // This works regardless of sensor rotation around the telescope tube!
+
+  // Current gravity magnitude
+  float gravityMag = sqrt(ax_g*ax_g + ay_g*ay_g + az_g*az_g);
+
+  // Reference gravity magnitude (from zero calibration)
+  float refGravityMag = sqrt(tubeAxis_x*tubeAxis_x + tubeAxis_y*tubeAxis_y + tubeAxis_z*tubeAxis_z);
+
+  if (gravityMag > 0.1 && refGravityMag > 0.1) {
+    // Normalize both vectors
+    float norm_ax = ax_g / gravityMag;
+    float norm_ay = ay_g / gravityMag;
+    float norm_az = az_g / gravityMag;
+
+    float norm_ref_x = tubeAxis_x / refGravityMag;
+    float norm_ref_y = tubeAxis_y / refGravityMag;
+    float norm_ref_z = tubeAxis_z / refGravityMag;
+
+    // Dot product gives us cos(angle) between the two gravity vectors
+    float dotProduct = norm_ax * norm_ref_x + norm_ay * norm_ref_y + norm_az * norm_ref_z;
+
+    // Clamp to [-1, 1] to avoid NaN from acos due to floating point errors
+    dotProduct = constrain(dotProduct, -1.0, 1.0);
+
+    // Angle between current and reference gravity vectors
+    float angleBetweenVectors = acos(dotProduct) * (180.0 / PI);
+
+    // This angle represents rotation of the telescope
+    // When telescope points up, gravity vector rotates "backward" relative to sensor
+    // We need to determine the sign (positive = up, negative = down)
+
+    // Cross product to determine direction
+    // cross = ref × current, the Z component tells us rotation direction
+    float cross_z = (norm_ref_x * norm_ay - norm_ref_y * norm_ax);
+
+    // If cross_z is positive, we're rotating upward; negative = downward
+    if (cross_z < 0) {
+      rawAngle = angleBetweenVectors;
+    } else {
+      rawAngle = -angleBetweenVectors;
+    }
+  } else {
+    rawAngle = 0.0;  // Fallback
+  }
+
+  // Apply calibration if available
+  if (isCalibrated) {
+    // Apply zero offset first
+    float corrected = rawAngle - zeroOffset;
+
+    // Apply two-point linear calibration
+    // Map from raw range to calibrated range
+    float range = stopB_raw - stopA_raw;
+
+    if (abs(range) > 0.1) {  // Avoid division by zero
+      // Use the stops as reference points
+      // The actual altitude difference between stops
+      float stopDiff = (stopB_raw - zeroOffset) - (stopA_raw - zeroOffset);
+
+      // Scale factor (should be close to 1.0 if sensor is well-aligned)
+      float scale = stopDiff / range;
+
+      currentAltitude = corrected;
+    } else {
+      // Fallback to zero-point calibration only
+      currentAltitude = corrected;
+    }
+  } else {
+    // No calibration, just show raw angle
+    currentAltitude = rawAngle;
+  }
+
+  // Apply exponential moving average filter
+  if (filteredAltitude == 0.0) {
+    // Initialize filter on first reading
+    filteredAltitude = currentAltitude;
+  } else {
+    filteredAltitude = ALPHA * currentAltitude + (1.0 - ALPHA) * filteredAltitude;
+  }
+}
+
+// ==================== CALIBRATION FUNCTIONS ====================
+
+void loadCalibration() {
+  // Read calibration flag
+  byte flag;
+  EEPROM.get(ADDR_CALIBRATED_FLAG, flag);
+
+  if (flag == 0xAA) {
+    // Valid calibration exists
+    EEPROM.get(ADDR_ZERO_OFFSET, zeroOffset);
+    EEPROM.get(ADDR_STOP_A_RAW, stopA_raw);
+    EEPROM.get(ADDR_STOP_B_RAW, stopB_raw);
+    EEPROM.get(ADDR_TUBE_AXIS_X, tubeAxis_x);
+    EEPROM.get(ADDR_TUBE_AXIS_Y, tubeAxis_y);
+    EEPROM.get(ADDR_TUBE_AXIS_Z, tubeAxis_z);
+    isCalibrated = true;
+
+    Serial.println("Calibration loaded:");
+    Serial.print("  Zero offset: "); Serial.println(zeroOffset);
+    Serial.print("  Stop A raw: "); Serial.println(stopA_raw);
+    Serial.print("  Stop B raw: "); Serial.println(stopB_raw);
+    Serial.print("  Tube axis: (");
+    Serial.print(tubeAxis_x, 3); Serial.print(", ");
+    Serial.print(tubeAxis_y, 3); Serial.print(", ");
+    Serial.print(tubeAxis_z, 3); Serial.println(")");
+  } else {
+    Serial.println("No calibration found in EEPROM");
+    isCalibrated = false;
+  }
+}
+
+void saveCalibration() {
+  EEPROM.put(ADDR_ZERO_OFFSET, zeroOffset);
+  EEPROM.put(ADDR_STOP_A_RAW, stopA_raw);
+  EEPROM.put(ADDR_STOP_B_RAW, stopB_raw);
+  EEPROM.put(ADDR_TUBE_AXIS_X, tubeAxis_x);
+  EEPROM.put(ADDR_TUBE_AXIS_Y, tubeAxis_y);
+  EEPROM.put(ADDR_TUBE_AXIS_Z, tubeAxis_z);
+  byte flag = 0xAA;
+  EEPROM.put(ADDR_CALIBRATED_FLAG, flag);
+  EEPROM.commit();
+
+  isCalibrated = true;
+
+  Serial.println("Calibration saved to EEPROM");
+}
+
+void calibrateZero() {
+  // Take multiple readings and average
+  const int numReadings = 50;
+  float sum_ax = 0.0;
+  float sum_ay = 0.0;
+  float sum_az = 0.0;
+
+  showMessage("MEASURING...", "Please wait");
+
+  for (int i = 0; i < numReadings; i++) {
+    int16_t ax, ay, az;
+    int16_t gx, gy, gz;
+    mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+
+    float ax_g = ax / 16384.0;
+    float ay_g = ay / 16384.0;
+    float az_g = az / 16384.0;
+
+    sum_ax += ax_g;
+    sum_ay += ay_g;
+    sum_az += az_g;
+
+    delay(20);
+  }
+
+  // Average the readings - this is gravity when telescope is level
+  float zero_ax = sum_ax / numReadings;
+  float zero_ay = sum_ay / numReadings;
+  float zero_az = sum_az / numReadings;
+
+  // Store this as reference (we'll use it later to compute tube axis with Stop B)
+  tubeAxis_x = zero_ax;
+  tubeAxis_y = zero_ay;
+  tubeAxis_z = zero_az;
+
+  // For now, zero offset is 0 (we'll refine this after Stop A and B calibration)
+  zeroOffset = 0.0;
+
+  Serial.print("Zero reference gravity: (");
+  Serial.print(tubeAxis_x, 3); Serial.print(", ");
+  Serial.print(tubeAxis_y, 3); Serial.print(", ");
+  Serial.print(tubeAxis_z, 3); Serial.println(")");
+}
+
+void calibrateStopA() {
+  // Take multiple readings and average
+  const int numReadings = 50;
+  float sum_angle = 0.0;
+
+  showMessage("MEASURING...", "Please wait");
+
+  for (int i = 0; i < numReadings; i++) {
+    int16_t ax, ay, az;
+    int16_t gx, gy, gz;
+    mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+
+    float ax_g = ax / 16384.0;
+    float ay_g = ay / 16384.0;
+    float az_g = az / 16384.0;
+
+    // Calculate angle using same method as readSensor()
+    float gravityMag = sqrt(ax_g*ax_g + ay_g*ay_g + az_g*az_g);
+    float refGravityMag = sqrt(tubeAxis_x*tubeAxis_x + tubeAxis_y*tubeAxis_y + tubeAxis_z*tubeAxis_z);
+
+    if (gravityMag > 0.1 && refGravityMag > 0.1) {
+      float norm_ax = ax_g / gravityMag;
+      float norm_ay = ay_g / gravityMag;
+      float norm_az = az_g / gravityMag;
+
+      float norm_ref_x = tubeAxis_x / refGravityMag;
+      float norm_ref_y = tubeAxis_y / refGravityMag;
+      float norm_ref_z = tubeAxis_z / refGravityMag;
+
+      float dotProduct = norm_ax * norm_ref_x + norm_ay * norm_ref_y + norm_az * norm_ref_z;
+      dotProduct = constrain(dotProduct, -1.0, 1.0);
+
+      float angleBetweenVectors = acos(dotProduct) * (180.0 / PI);
+
+      float cross_z = (norm_ref_x * norm_ay - norm_ref_y * norm_ax);
+
+      float angle;
+      if (cross_z < 0) {
+        angle = angleBetweenVectors;
+      } else {
+        angle = -angleBetweenVectors;
+      }
+
+      sum_angle += angle;
+    }
+
+    delay(20);
+  }
+
+  stopA_raw = sum_angle / numReadings;
+  Serial.print("Stop A calibrated: "); Serial.println(stopA_raw);
+}
+
+void calibrateStopB() {
+  // Take multiple readings and average
+  const int numReadings = 50;
+  float sum_angle = 0.0;
+
+  showMessage("MEASURING...", "Please wait");
+
+  for (int i = 0; i < numReadings; i++) {
+    int16_t ax, ay, az;
+    int16_t gx, gy, gz;
+    mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+
+    float ax_g = ax / 16384.0;
+    float ay_g = ay / 16384.0;
+    float az_g = az / 16384.0;
+
+    // Calculate angle using same method as readSensor()
+    float gravityMag = sqrt(ax_g*ax_g + ay_g*ay_g + az_g*az_g);
+    float refGravityMag = sqrt(tubeAxis_x*tubeAxis_x + tubeAxis_y*tubeAxis_y + tubeAxis_z*tubeAxis_z);
+
+    if (gravityMag > 0.1 && refGravityMag > 0.1) {
+      float norm_ax = ax_g / gravityMag;
+      float norm_ay = ay_g / gravityMag;
+      float norm_az = az_g / gravityMag;
+
+      float norm_ref_x = tubeAxis_x / refGravityMag;
+      float norm_ref_y = tubeAxis_y / refGravityMag;
+      float norm_ref_z = tubeAxis_z / refGravityMag;
+
+      float dotProduct = norm_ax * norm_ref_x + norm_ay * norm_ref_y + norm_az * norm_ref_z;
+      dotProduct = constrain(dotProduct, -1.0, 1.0);
+
+      float angleBetweenVectors = acos(dotProduct) * (180.0 / PI);
+
+      float cross_z = (norm_ref_x * norm_ay - norm_ref_y * norm_ax);
+
+      float angle;
+      if (cross_z < 0) {
+        angle = angleBetweenVectors;
+      } else {
+        angle = -angleBetweenVectors;
+      }
+
+      sum_angle += angle;
+    }
+
+    delay(20);
+  }
+
+  stopB_raw = sum_angle / numReadings;
+  Serial.print("Stop B calibrated: "); Serial.println(stopB_raw);
+}
+
+void syncAtStopA() {
+  // Take multiple readings and average
+  const int numReadings = 50;
+  float sum_angle = 0.0;
+
+  showMessage("SYNCING...", "Please wait");
+
+  for (int i = 0; i < numReadings; i++) {
+    int16_t ax, ay, az;
+    int16_t gx, gy, gz;
+    mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+
+    float ax_g = ax / 16384.0;
+    float ay_g = ay / 16384.0;
+    float az_g = az / 16384.0;
+
+    // Calculate angle using same method as readSensor()
+    float gravityMag = sqrt(ax_g*ax_g + ay_g*ay_g + az_g*az_g);
+    float refGravityMag = sqrt(tubeAxis_x*tubeAxis_x + tubeAxis_y*tubeAxis_y + tubeAxis_z*tubeAxis_z);
+
+    if (gravityMag > 0.1 && refGravityMag > 0.1) {
+      float norm_ax = ax_g / gravityMag;
+      float norm_ay = ay_g / gravityMag;
+      float norm_az = az_g / gravityMag;
+
+      float norm_ref_x = tubeAxis_x / refGravityMag;
+      float norm_ref_y = tubeAxis_y / refGravityMag;
+      float norm_ref_z = tubeAxis_z / refGravityMag;
+
+      float dotProduct = norm_ax * norm_ref_x + norm_ay * norm_ref_y + norm_az * norm_ref_z;
+      dotProduct = constrain(dotProduct, -1.0, 1.0);
+
+      float angleBetweenVectors = acos(dotProduct) * (180.0 / PI);
+
+      float cross_z = (norm_ref_x * norm_ay - norm_ref_y * norm_ax);
+
+      float angle;
+      if (cross_z < 0) {
+        angle = angleBetweenVectors;
+      } else {
+        angle = -angleBetweenVectors;
+      }
+
+      sum_angle += angle;
+    }
+
+    delay(20);
+  }
+
+  stopA_raw = sum_angle / numReadings;
+  Serial.print("Stop A synced: "); Serial.println(stopA_raw);
+}
+
+void syncAtStopB() {
+  // Take multiple readings and average
+  const int numReadings = 50;
+  float sum_angle = 0.0;
+
+  showMessage("SYNCING...", "Please wait");
+
+  for (int i = 0; i < numReadings; i++) {
+    int16_t ax, ay, az;
+    int16_t gx, gy, gz;
+    mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+
+    float ax_g = ax / 16384.0;
+    float ay_g = ay / 16384.0;
+    float az_g = az / 16384.0;
+
+    // Calculate angle using same method as readSensor()
+    float gravityMag = sqrt(ax_g*ax_g + ay_g*ay_g + az_g*az_g);
+    float refGravityMag = sqrt(tubeAxis_x*tubeAxis_x + tubeAxis_y*tubeAxis_y + tubeAxis_z*tubeAxis_z);
+
+    if (gravityMag > 0.1 && refGravityMag > 0.1) {
+      float norm_ax = ax_g / gravityMag;
+      float norm_ay = ay_g / gravityMag;
+      float norm_az = az_g / gravityMag;
+
+      float norm_ref_x = tubeAxis_x / refGravityMag;
+      float norm_ref_y = tubeAxis_y / refGravityMag;
+      float norm_ref_z = tubeAxis_z / refGravityMag;
+
+      float dotProduct = norm_ax * norm_ref_x + norm_ay * norm_ref_y + norm_az * norm_ref_z;
+      dotProduct = constrain(dotProduct, -1.0, 1.0);
+
+      float angleBetweenVectors = acos(dotProduct) * (180.0 / PI);
+
+      float cross_z = (norm_ref_x * norm_ay - norm_ref_y * norm_ax);
+
+      float angle;
+      if (cross_z < 0) {
+        angle = angleBetweenVectors;
+      } else {
+        angle = -angleBetweenVectors;
+      }
+
+      sum_angle += angle;
+    }
+
+    delay(20);
+  }
+
+  stopB_raw = sum_angle / numReadings;
+  Serial.print("Stop B synced: "); Serial.println(stopB_raw);
+
+  // Save updated calibration
+  saveCalibration();
+}
+
+// ==================== BUTTON HANDLING ====================
+
+void handleButton() {
+  bool buttonState = digitalRead(BUTTON_PIN);
+  
+  // Detect button press (HIGH to LOW transition)
+  if (buttonState == LOW && lastButtonState == HIGH) {
+    buttonPressTime = millis();
+    longPressDetected = false;
+  }
+  
+  // Detect long press while button is held
+  if (buttonState == LOW && !longPressDetected) {
+    if (millis() - buttonPressTime > LONG_PRESS_TIME) {
+      longPressDetected = true;
+      onLongPress();
+    }
+  }
+  
+  // Detect button release
+  if (buttonState == HIGH && lastButtonState == LOW) {
+    unsigned long pressDuration = millis() - buttonPressTime;
+    
+    if (pressDuration < LONG_PRESS_TIME && !longPressDetected) {
+      onShortPress();
+    }
+  }
+  
+  lastButtonState = buttonState;
+}
+
+void onShortPress() {
+  Serial.println("Button: Short press");
+  
+  switch (currentMode) {
+    case MODE_NORMAL:
+      if (isCalibrated) {
+        // Start two-point session sync
+        currentMode = MODE_SESSION_SYNC_A;
+      } else {
+        showMessage("ERROR", "Not calibrated!");
+        delay(1500);
+      }
+      break;
+      
+    case MODE_SESSION_SYNC_A:
+      // Sync at Stop A
+      syncAtStopA();
+      showMessage("STOP A", "Synced!");
+      delay(1000);
+      currentMode = MODE_SESSION_SYNC_B;
+      break;
+      
+    case MODE_SESSION_SYNC_B:
+      // Sync at Stop B
+      syncAtStopB();
+      showMessage("SYNCED!", "Ready to observe");
+      delay(1500);
+      currentMode = MODE_NORMAL;
+      break;
+      
+    case MODE_CALIBRATION_MENU:
+      // Start zero calibration
+      currentMode = MODE_ZERO_CALIBRATION;
+      break;
+      
+    case MODE_ZERO_CALIBRATION:
+      calibrateZero();
+      showMessage("ZERO SET", "");
+      delay(1500);
+      currentMode = MODE_STOP_A_CALIBRATION;
+      break;
+      
+    case MODE_STOP_A_CALIBRATION:
+      calibrateStopA();
+      showMessage("STOP A SET", "");
+      delay(1500);
+      currentMode = MODE_STOP_B_CALIBRATION;
+      break;
+      
+    case MODE_STOP_B_CALIBRATION:
+      calibrateStopB();
+      saveCalibration();
+      showMessage("CALIBRATED!", "Saved to memory");
+      delay(2000);
+      currentMode = MODE_NORMAL;
+      break;
+  }
+}
+
+void onLongPress() {
+  Serial.println("Button: Long press");
+  
+  if (currentMode == MODE_NORMAL) {
+    // Enter calibration menu
+    currentMode = MODE_CALIBRATION_MENU;
+    Serial.println("Entering calibration mode");
+  } else {
+    // Cancel calibration/sync and return to normal
+    currentMode = MODE_NORMAL;
+    Serial.println("Operation cancelled");
+    showMessage("CANCELLED", "");
+    delay(1000);
+  }
+}
+
+// ==================== DISPLAY FUNCTIONS ====================
+
+bool initDisplay() {
+  display.begin();
+  display.clearBuffer();
+  display.sendBuffer();
+  
+  Serial.println("Display initialized successfully");
+  return true;
+}
+
+void updateDisplay() {
+  display.clearBuffer();
+  
+  switch (currentMode) {
+    case MODE_NORMAL:
+      displayNormalMode();
+      break;
+      
+    case MODE_CALIBRATION_MENU:
+      displayCalibrationMenu();
+      break;
+      
+    case MODE_ZERO_CALIBRATION:
+      displayZeroCalibration();
+      break;
+      
+    case MODE_STOP_A_CALIBRATION:
+      displayStopACalibration();
+      break;
+      
+    case MODE_STOP_B_CALIBRATION:
+      displayStopBCalibration();
+      break;
+      
+    case MODE_SESSION_SYNC_A:
+      displaySessionSyncA();
+      break;
+      
+    case MODE_SESSION_SYNC_B:
+      displaySessionSyncB();
+      break;
+  }
+  
+  display.sendBuffer();
+}
+
+void displayNormalMode() {
+  // YELLOW ZONE (0-10): Title only
+  display.setFont(u8g2_font_6x10_tf);
+  display.drawStr(0, 9, "ALTITUDE");
+  
+  if (!isCalibrated) {
+    display.drawStr(70, 9, "[UNCAL]");
+  }
+  
+  // BLUE ZONE (13-64): Main altitude reading
+  display.setFont(u8g2_font_logisoso24_tn);
+  
+  char altStr[10];
+  if (filteredAltitude >= 0) {
+    snprintf(altStr, sizeof(altStr), "+%.1f", filteredAltitude);
+  } else {
+    snprintf(altStr, sizeof(altStr), "%.1f", filteredAltitude);
+  }
+  display.drawStr(0, 42, altStr);
+  
+  // Degree symbol
+  display.setFont(u8g2_font_6x10_tf);
+  display.drawStr(90, 42, "o");
+  
+  // Debug info at bottom
+  display.setCursor(0, 62);
+  display.print("Raw: ");
+  display.print(rawAngle, 1);
+  display.print("o");
+}
+
+void displayCalibrationMenu() {
+  // YELLOW ZONE (0-10): Title
+  display.setFont(u8g2_font_7x13_tf);
+  display.drawStr(0, 9, "CALIBRATION");
+  
+  // BLUE ZONE (13-64): Instructions
+  display.setFont(u8g2_font_6x10_tf);
+  display.drawStr(0, 25, "1. Level telescope");
+  display.drawStr(0, 37, "2. Press button");
+  display.drawStr(0, 52, "Hold to cancel");
+}
+
+void displayZeroCalibration() {
+  // YELLOW ZONE (0-10): Title
+  display.setFont(u8g2_font_7x13_tf);
+  display.drawStr(0, 9, "STEP 1: ZERO");
+  
+  // BLUE ZONE (13-64): Instructions
+  display.setFont(u8g2_font_6x10_tf);
+  display.drawStr(0, 25, "Level telescope");
+  display.drawStr(0, 37, "with bubble level");
+  display.drawStr(0, 52, "Press when ready");
+  
+  // Current angle at bottom
+  display.setCursor(0, 62);
+  display.print("Raw: ");
+  display.print(rawAngle, 1);
+  display.print("o");
+}
+
+void displayStopACalibration() {
+  // YELLOW ZONE (0-10): Title
+  display.setFont(u8g2_font_7x13_tf);
+  display.drawStr(0, 9, "STEP 2: STOP A");
+  
+  // BLUE ZONE (13-64): Instructions
+  display.setFont(u8g2_font_6x10_tf);
+  display.drawStr(0, 25, "Move to Stop A");
+  display.drawStr(0, 37, "(low position)");
+  display.drawStr(0, 52, "Press when ready");
+  
+  // Current angle at bottom
+  display.setCursor(0, 62);
+  display.print("Raw: ");
+  display.print(rawAngle, 1);
+  display.print("o");
+}
+
+void displayStopBCalibration() {
+  // YELLOW ZONE (0-10): Title
+  display.setFont(u8g2_font_7x13_tf);
+  display.drawStr(0, 9, "STEP 3: STOP B");
+  
+  // BLUE ZONE (13-64): Instructions
+  display.setFont(u8g2_font_6x10_tf);
+  display.drawStr(0, 25, "Move to Stop B");
+  display.drawStr(0, 37, "(high position)");
+  display.drawStr(0, 52, "Press when ready");
+  
+  // Current angle at bottom
+  display.setCursor(0, 62);
+  display.print("Raw: ");
+  display.print(rawAngle, 1);
+  display.print("o");
+}
+
+void displaySessionSyncA() {
+  // YELLOW ZONE (0-10): Title
+  display.setFont(u8g2_font_7x13_tf);
+  display.drawStr(0, 9, "SESSION SYNC");
+  
+  // BLUE ZONE (13-64): Instructions
+  display.setFont(u8g2_font_6x10_tf);
+  display.drawStr(0, 25, "Move to Stop A");
+  display.drawStr(0, 37, "(low position)");
+  display.drawStr(0, 52, "Press when ready");
+  
+  // Current angle at bottom
+  display.setCursor(0, 62);
+  display.print("Raw: ");
+  display.print(rawAngle, 1);
+  display.print("o");
+}
+
+void displaySessionSyncB() {
+  // YELLOW ZONE (0-10): Title
+  display.setFont(u8g2_font_7x13_tf);
+  display.drawStr(0, 9, "SESSION SYNC");
+  
+  // BLUE ZONE (13-64): Instructions
+  display.setFont(u8g2_font_6x10_tf);
+  display.drawStr(0, 25, "Move to Stop B");
+  display.drawStr(0, 37, "(high position)");
+  display.drawStr(0, 52, "Press when ready");
+  
+  // Current angle at bottom
+  display.setCursor(0, 62);
+  display.print("Raw: ");
+  display.print(rawAngle, 1);
+  display.print("o");
+}
+
+void showStartupScreen() {
+  display.clearBuffer();
+  
+  // YELLOW ZONE (0-10): Empty
+  display.setFont(u8g2_font_7x13_tf);
+  display.drawStr(0, 8, "By: pavelosky");
+  
+  // BLUE ZONE (13-64): Main content
+  display.setFont(u8g2_font_10x20_tf);
+  display.drawStr(10, 32, "TELESCOPE");
+  display.drawStr(10, 50, "ALTIMETER");
+  display.setFont(u8g2_font_6x10_tf);
+  display.drawStr(50, 60, "v2.1");
+  
+  display.sendBuffer();
+}
+
+void showError(const char* message) {
+  display.clearBuffer();
+  
+  // YELLOW ZONE (0-10): Empty
+  
+  // BLUE ZONE (13-64): Error message
+  display.setFont(u8g2_font_10x20_tf);
+  display.drawStr(10, 32, "ERROR:");
+  display.setFont(u8g2_font_6x10_tf);
+  display.drawStr(10, 50, message);
+  
+  display.sendBuffer();
+}
+
+void showMessage(const char* title, const char* message) {
+  display.clearBuffer();
+  
+  // YELLOW ZONE (0-10): Empty
+  
+  // BLUE ZONE (13-64): Message
+  display.setFont(u8g2_font_10x20_tf);
+  display.drawStr(0, 30, title);
+  display.setFont(u8g2_font_6x10_tf);
+  display.drawStr(0, 50, message);
+  
+  display.sendBuffer();
+}
