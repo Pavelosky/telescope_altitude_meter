@@ -64,26 +64,36 @@ void TelescopeDisplay::displayNormalMode(float filteredAltitude, float rawAngle,
     display.drawStr(70, 9, "[UNCAL]");
   }
 
-  // BLUE ZONE (13-64): Main altitude reading
-  display.setFont(u8g2_font_logisoso24_tn);
+  // BLUE ZONE (13-64): Main altitude reading in degrees and minutes
+  // Convert decimal degrees to degrees and minutes
+  int degrees = (int)filteredAltitude;
+  float decimalPart = filteredAltitude - degrees;
+  int minutes = (int)(abs(decimalPart) * 60.0);
 
-  char altStr[10];
-  if (filteredAltitude >= 0) {
-    snprintf(altStr, sizeof(altStr), "+%.1f", filteredAltitude);
-  } else {
-    snprintf(altStr, sizeof(altStr), "%.1f", filteredAltitude);
-  }
-  display.drawStr(0, 42, altStr);
+  // Build degrees string (no sign)
+  char altStr[16];
+  snprintf(altStr, sizeof(altStr), "%d", abs(degrees));
 
-  // Degree symbol
-  display.setFont(u8g2_font_6x10_tf);
-  display.drawStr(90, 42, "o");
+  // Display degrees (larger font)
+  display.setFont(u8g2_font_logisoso22_tn);
+  int xPos = display.drawStr(1, 42, altStr);
+
+  // Display degree symbol (medium font, superscript position)
+  display.setFont(u8g2_font_9x18_tf);
+  display.drawStr(xPos + 1, 28, "\xB0");  // \xB0 is degree symbol
+
+  // Display minutes (medium font, right after degrees)
+  display.setFont(u8g2_font_10x20_tf);
+  char minStr[8];
+  snprintf(minStr, sizeof(minStr), "%02d'", minutes);
+  display.drawStr(xPos + 10, 42, minStr);
 
   // Debug info at bottom
+  display.setFont(u8g2_font_6x10_tf);
   display.setCursor(0, 62);
   display.print("Raw: ");
   display.print(rawAngle, 1);
-  display.print("o");
+  display.print((char)176);  // Degree symbol
 }
 
 void TelescopeDisplay::displayCalibrationMenu() {
@@ -113,7 +123,7 @@ void TelescopeDisplay::displayZeroCalibration(float rawAngle) {
   display.setCursor(0, 62);
   display.print("Raw: ");
   display.print(rawAngle, 1);
-  display.print("o");
+  display.print("°");
 }
 
 void TelescopeDisplay::displayStopACalibration(float rawAngle) {
@@ -193,7 +203,7 @@ void TelescopeDisplay::showStartup() {
 
   // YELLOW ZONE (0-10): Empty
   display.setFont(u8g2_font_7x13_tf);
-  display.drawStr(0, 8, "By: pavelosky");
+  display.drawStr(0, 8, "Sky Watcher Classic 200");
 
   // BLUE ZONE (13-64): Main content
   display.setFont(u8g2_font_10x20_tf);
